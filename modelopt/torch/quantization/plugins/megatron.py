@@ -173,7 +173,7 @@ def quant_module_set_extra_state(self, state: Any):
     weight_quantizer, input_quantizer, and output_quantizer.
 
     Once all quantizer_state are resumed, modelopt_post_restore() is called
-    to adjust the shape of all buffers (amax, pre_qunat_scale, _scale, ...) since
+    to adjust the shape of all buffers (amax, pre_quant_scale, _scale, ...) since
     the local shape can be different from the shape in the state due to change
     in tensor parallelism (TP).
     """
