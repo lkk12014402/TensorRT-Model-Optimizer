@@ -109,6 +109,9 @@ class QuantInputBase(QuantModule):
 
     def forward(self, input, *args, **kwargs):
         """Quantize the input before calling the original forward method."""
+
+        # print("====================================================QuantInputBase forward")
+
         input = self.input_quantizer(input)
         output = super().forward(input, *args, **kwargs)
         if isinstance(output, tuple):
@@ -154,6 +157,8 @@ class QuantLinearConvBase(QuantInputBase):
     def forward(self, input, *args, **kwargs):
         """Quantize the input and the weight before calling the original forward method."""
         # self.quntize_weight() setting attributes is not allowed for torch.export.
+
+        # print("====================================================QuantLinearConvBase forward")
         if is_torch_export_mode():
             return super().forward(input, *args, **kwargs)
 

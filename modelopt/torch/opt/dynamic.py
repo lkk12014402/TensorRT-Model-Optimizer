@@ -647,6 +647,10 @@ class DynamicModule(nn.Module):
                     " might not work."
                 )
 
+        print("=*-*="*20)
+        print(module)
+        print(cls)
+        print("=*-*="*20)
         # update class
         original_cls = type(module)
         module.__class__ = cls

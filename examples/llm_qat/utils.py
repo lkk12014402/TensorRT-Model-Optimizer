@@ -43,6 +43,69 @@ def main_process_first():
         yield
     torch.distributed.barrier()
 
+def get_cnn_mlperf(
+    tokenizer: transformers.AutoTokenizer,
+    split="train",
+    max_length=4096,
+    train_size=0,
+    eval_size=0,
+):
+
+    def process_and_tokenize(sample):
+        conversations = sample["conversations"]
+        # all_input_ids = [tokenizer.bos_token_id] if tokenizer.bos_token_id else []
+        all_input_ids = []
+        # all_labels = [IGNORE_INDEX] if tokenizer.bos_token_id else []
+        all_labels = []
+
+        for conversation in conversations:
+            role = conversation["from"]
+            input_ids = tokenizer.encode(conversation["value"].replace('\xa0', ' ') + "\n", add_special_tokens=False)
+            # labels = input_ids if role == "Assistant" else [IGNORE_INDEX] * len(input_ids)
+            labels = input_ids
+
+            all_input_ids.extend(input_ids)
+            all_labels.extend(labels)
+
+            if len(all_input_ids) > max_length:
+                break
+
+        all_input_ids.append(tokenizer.eos_token_id)
+        all_labels.append(IGNORE_INDEX)
+        all_attention_mask = [1] * len(all_input_ids)
+
+        cur_seq_length = len(all_input_ids)
+        if cur_seq_length < max_length:
+            pad_token = (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            )
+            all_input_ids += [pad_token] * (max_length - cur_seq_length)
+            all_attention_mask += [0] * (max_length - cur_seq_length)
+            all_labels += [IGNORE_INDEX] * (max_length - cur_seq_length)
+
+        return {
+            "input_ids": all_input_ids[:max_length],
+            "attention_mask": all_attention_mask[:max_length],
+            "labels": all_labels[:max_length],
+        }
+
+    if split == "train":
+        with main_process_first():
+            dataset = datasets.load_dataset("/sdp/lkk/mlperf/TensorRT-LLM/examples/quantization/inference_results_v5.1/closed/NVIDIA/code/llama3_1-8b/tensorrt/build/preprocessed_data/llama3.1-8b/mlperf_llama3.1-8b_calibration_1k_chat", split='train')
+            dataset = dataset.shuffle(seed=42)
+            # print(dataset[0])
+            dataset = dataset.map(process_and_tokenize, remove_columns=list(dataset.features))
+    else:
+        with main_process_first():
+            dataset = datasets.load_dataset("/sdp/lkk/mlperf/TensorRT-LLM/examples/quantization/inference_results_v5.1/closed/NVIDIA/code/llama3_1-8b/tensorrt/build/preprocessed_data/llama3.1-8b/mlperf_llama3.1-8b_val_1k_chat", split='train')
+            dataset = dataset.map(process_and_tokenize, remove_columns=list(dataset.features))
+
+    # print(dataset[0])
+    # exit()
+    return dataset
+
 
 def get_daring_anteater(
     tokenizer: transformers.AutoTokenizer,
@@ -133,7 +196,12 @@ def make_supervised_data_module(
             tokenizer, "test", tokenizer.model_max_length, train_size, eval_size
         )
     else:
-        raise ValueError(f"Dataset {dataset} not supported")
+        train_dataset = get_cnn_mlperf(
+            tokenizer, "train", tokenizer.model_max_length, train_size, eval_size
+        )
+        val_dataset = get_cnn_mlperf(
+            tokenizer, "test", tokenizer.model_max_length, train_size, eval_size
+        )
     return {
         "train_dataset": train_dataset,
         "eval_dataset": val_dataset,

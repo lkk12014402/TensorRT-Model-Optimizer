@@ -58,7 +58,7 @@ from utils import (
 import modelopt.torch.opt as mto
 
 # import ModelOpt's QATSFTTrainer instead of Huggingface TRL's SFTTrainer
-from modelopt.torch.quantization.plugins import QATSFTTrainer, QuantizationArguments
+from modelopt.torch.quantization.plugins import QATTrainer, QuantizationArguments
 
 # Enable automatic save/load of modelopt state huggingface checkpointing
 mto.enable_huggingface_checkpointing()
@@ -97,7 +97,7 @@ def main(script_args, training_args, model_args, quant_args):
     # Train model
     # -------------
     # Use ModelOpt's QATSFTTrainer instead of Huggingface TRL's SFTTrainer
-    trainer = QATSFTTrainer(
+    trainer = QATTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
@@ -105,7 +105,7 @@ def main(script_args, training_args, model_args, quant_args):
         if training_args.eval_strategy != "no"
         else None,
         processing_class=tokenizer,
-        peft_config=get_peft_config_for_moe(model, model_args),
+        # peft_config=get_peft_config_for_moe(model, model_args),
         quant_args=quant_args,
     )
 

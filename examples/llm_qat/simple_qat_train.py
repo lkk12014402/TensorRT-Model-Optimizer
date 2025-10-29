@@ -21,11 +21,14 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+
+set_seed(100)
 from utils import get_daring_anteater
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
+
 
 
 def get_dataloader(args, tokenizer):
@@ -65,7 +68,8 @@ def train(model, optimizer, train_dataloader, tokenizer, epochs, output_dir, dev
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            pbar_batch.set_description(f"loss: {loss.item():.4f}")
+            # pbar_batch.set_description(f"loss: {loss.item():.4f}")
+            print(f"loss: {loss.item():.4f}")
         print(f"Epoch {epoch + 1} completed | Loss: {loss.item():.4f}")
 
     if output_dir:
@@ -120,8 +124,14 @@ def main() -> None:
         for batch in calib_dataloader:
             m(batch["input_ids"].to(device))
 
+
+    print(args.quant_cfg)
+    print(getattr(mtq, args.quant_cfg))
     # Quantize the model
     model = mtq.quantize(model, getattr(mtq, args.quant_cfg), calibrate)
+
+    print(model)
+    # exit()
 
     # Initialize optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr)

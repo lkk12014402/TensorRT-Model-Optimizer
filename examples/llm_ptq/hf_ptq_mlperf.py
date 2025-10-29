@@ -25,9 +25,7 @@ import torch
 from accelerate.hooks import remove_hook_from_module
 from example_utils import apply_kv_cache_quant, get_model, get_processor, get_tokenizer, is_enc_dec
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
-    AutoProcessor,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
     WhisperProcessor,
@@ -41,20 +39,22 @@ from modelopt.torch.export import (
     export_tensorrt_llm_checkpoint,
     get_model_type,
 )
-from modelopt.torch.export.model_utils import is_multimodal_model
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.quantization.plugins.accelerate import init_quantized_weights
 from modelopt.torch.quantization.utils import is_quantized
 from modelopt.torch.utils.dataset_utils import (
     create_forward_loop,
-    get_dataset_dataloader,
+    # get_dataset_dataloader,
     get_max_batch_size,
-    get_supported_datasets,
+    _CustomDataset,
 )
 from modelopt.torch.utils.image_processor import MllamaImageProcessor
 from modelopt.torch.utils.memory_monitor import launch_memory_monitor
 from modelopt.torch.utils.speech_dataset_utils import get_speech_dataset_dataloader
 from modelopt.torch.utils.vlm_dataset_utils import get_vlm_dataset_dataloader
+
+from torch.utils.data import DataLoader
+import math
 
 RAND_SEED = 1234
 
@@ -65,14 +65,10 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "nvfp4": mtq.NVFP4_DEFAULT_CFG,
-    "mxfp4": mtq.MXFP4_DEFAULT_CFG,
-    "mxfp8": mtq.MXFP8_DEFAULT_CFG,
     "nvfp4_awq": mtq.NVFP4_AWQ_LITE_CFG,
     "fp8_pb_wo": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
     "fp8_pc_pt": mtq.FP8_PER_CHANNEL_PER_TOKEN_CFG,
-    "w4a8_nvfp4_fp8": mtq.W4A8_NVFP4_FP8_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
-    "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
 }
 
 KV_QUANT_CFG_CHOICES = {
@@ -85,27 +81,159 @@ KV_QUANT_CFG_CHOICES = {
 mto.enable_huggingface_checkpointing()
 
 
+def _get_dataset_samples(dataset_name: str, num_samples: int) -> list[str]:
+    """Load a portion of train dataset with the dataset name and a given size.
+
+    Args:
+        dataset_name: Name of the dataset to load.
+        num_samples: Number of samples to load from the dataset.
+
+    Returns:
+        Samples: The list of samples.
+    """
+    # Load the dataset
+    """
+    if dataset_name not in SUPPORTED_DATASET_CONFIG:
+        raise NotImplementedError(
+            f"dataset {dataset_name} is not supported. Please use one of the following:"
+            f" {get_supported_datasets()}."
+        )
+    """
+
+    from datasets import load_dataset
+
+    """
+    dataset_config = SUPPORTED_DATASET_CONFIG[dataset_name]
+    # It's unfortunate that the load_dataset function does not support split a list while streaming.
+    # So we need to load the dataset for each split.
+    config = dataset_config["config"].copy()
+    splits = config.pop("split", [None])
+    dataset_splits = [
+        load_dataset(
+            streaming=True,
+            **config,
+            split=split,
+        )
+        for split in splits
+    ]
+    """
+    dataset_splits = [load_dataset(dataset_name)]
+    print(dataset_splits)
+
+    preprocess = lambda sample: sample["text"]
+
+    # Split the samples evenly across the splits
+    # For streaming datasets, there is no reliable way to get the number of samples in each split
+    # other than loading the entire dataset. So, we just use the same number of samples for each split.
+    num_samples_splits = [num_samples // len(dataset_splits) for _ in dataset_splits]
+    num_samples_splits[-1] += num_samples - sum(num_samples_splits)
+    samples = []
+    for dataset, num_samples_split in zip(dataset_splits, num_samples_splits):
+        for i, sample in enumerate(dataset["train"]):
+            if i >= num_samples_split:
+                break
+
+            # Apply preprocess function to the sample
+            samples.append(preprocess(sample))
+
+    return samples
+
+def get_dataset_dataloader(
+    dataset_name: str | list[str] = "cnn_dailymail",
+    tokenizer: "PreTrainedTokenizerBase | None" = None,
+    batch_size: int = 1,
+    num_samples: int | list[int] = 512,
+    max_sample_length: int = 512,
+    device: str | None = None,
+    include_labels: bool = False,
+) -> DataLoader:
+    """Get a dataloader with the dataset name and toknizer of the target model.
+
+    Args:
+        dataset_name: Name of the dataset to load.
+        tokenizer: Instancne of Hugginface tokenizer.
+        batch_size: Batch size of the returned dataloader.
+        num_samples: Number of samples from the dataset.
+        max_sample_length: Maximum length of a sample.
+        device: Target device for the returned dataloader.
+        include_labels: Whether to include labels in the dataloader.
+
+    Returns:
+        A instance of dataloader.
+    """
+    assert tokenizer is not None, "Please provide a tokenizer."
+    # batch_encode_plus will modify the tokenizer in place, so we need to clone it.
+    tokenizer = copy.deepcopy(tokenizer)
+
+    if tokenizer.padding_side != "left":
+        warn(
+            "Tokenizer with the right padding_side may impact calibration accuracy. Recommend set to left"
+        )
+
+    if isinstance(num_samples, int):
+        num_samples = [num_samples]
+
+    if isinstance(dataset_name, str):
+        dataset_name = [dataset_name]
+
+    num_samples = [math.ceil(num_sample / batch_size) * batch_size for num_sample in num_samples]
+
+    assert len(dataset_name) == len(num_samples), (
+        "dataset_name and num_samples must be the same length"
+    )
+
+    all_samples = []
+    for ds_name, num_sample in zip(dataset_name, num_samples):
+        samples = _get_dataset_samples(ds_name, num_sample)
+        all_samples.extend(samples)
+
+    batch_encoded = tokenizer.batch_encode_plus(
+        all_samples,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_sample_length,
+    )
+    if device:
+        batch_encoded = batch_encoded.to(device)
+
+    if include_labels:
+        # Labels are needed when backward is called in the model.
+        # The labels should be a shifted version of the input_ids.
+        # However, we should not shift the input_ids here since the labels are shifted by
+        # Huggingface models during loss calculation as shown here -
+        # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
+        batch_encoded["labels"] = torch.where(
+            batch_encoded["attention_mask"] > 0.5, batch_encoded["input_ids"], -100
+        )
+        tokenized_dataset = _CustomDataset(batch_encoded)
+    else:
+        # For backward compatibility, if labels are not needed, we only return the input_ids.
+        tokenized_dataset = _CustomDataset({"input_ids": batch_encoded["input_ids"]})
+
+    calib_dataloader = DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=False)
+
+    return calib_dataloader
+
+
 def auto_quantize(
     model, qformat, auto_quantize_bits, calib_dataloader, calibrate_loop, batch_size=1
 ):
     qformat_list = qformat.split(",")
     assert qformat_list, "No quantization formats provided"
     # Check if all provided quantization formats are supported
-    assert all(
-        qformat
-        in [
-            "fp8",
-            "int8_sq",
-            "int4_awq",
-            "nvfp4",
-            "nvfp4_awq",
-            "w4a8_awq",
-            "fp8_pb_wo",
-            "w4a8_mxfp4_fp8",
-            "nvfp4_mlp_only",
-        ]
-        for qformat in qformat_list
-    ), "One or more quantization formats provided are not supported for unified checkpoint export"
+    if args.export_fmt == "hf":
+        assert all(
+            qformat in ["fp8", "int4_awq", "nvfp4", "nvfp4_awq", "w4a8_awq", "fp8_pb_wo"]
+            for qformat in qformat_list
+        ), (
+            "One or more quantization formats provided are not supported for unified checkpoint export"
+        )
+    else:
+        assert all(
+            qformat in ["fp8", "int8_sq", "int4_awq", "w4a8_awq", "nvfp4", "nvfp4_awq"]
+            for qformat in qformat_list
+        ), "One or more quantization formats provided are not supported for tensorrt llm export"
 
     def loss_func(output, data):
         # For transformers AutoModelForCausalLM models, the outputs are wrapped in `CausalLMOutputWithPast`
@@ -121,7 +249,9 @@ def auto_quantize(
         # TRTLLM only support one quantization format or None (do not quantize, internally supported)
         quantization_formats=[QUANT_CFG_CHOICES[format] for format in qformat_list],
         num_calib_steps=len(calib_dataloader),
-        num_score_steps=len(calib_dataloader),
+        num_score_steps=min(
+            len(calib_dataloader), 128 // batch_size
+        ),  # Limit the number of score steps to avoid long calibration time
         verbose=True,
         disabled_layers=["*lm_head*"],
     )
@@ -142,11 +272,6 @@ def auto_quantize(
             model, {"*": {"enable": False}, **kv_cache_quant_cfg}
         ):
             mtq.calibrate(model, algorithm="max", forward_loop=calibrate_loop)
-
-
-    print(model)
-
-    # exit()
     return model
 
 
@@ -155,8 +280,8 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
     #
     # Example usage:
     # from modelopt.torch.utils.dataset_utils import create_forward_loop
-    # model = ...  # Initialize the model
-    # tokenizer = ...  # Initialize the tokenizer
+    # model = ...  # Initilaize the model
+    # tokenizer = ...  # Initilaize the tokenizer
     # quant_cfg = ...  # Setup quantization configuration
     # forward_loop = create_forward_loop(model=model, dataset_name="cnn_dailymail", tokenizer=tokenizer)
     # mtq.quantize(model, quant_cfg, forward_loop=forward_loop)
@@ -172,6 +297,7 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
 
     use_calibration = args.auto_quantize_bits or need_calibration(quant_cfg)
 
+    print(f"=====================================use_calibration: {use_calibration}")
     if not use_calibration:
         warnings.warn("Dynamic quantization. Calibration skipped.")
     calibrate_loop = create_forward_loop(dataloader=calib_dataloader) if use_calibration else None
@@ -194,6 +320,7 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None, calibration_on
     elif calibration_only:
         model = mtq.calibrate(model, quant_cfg["algorithm"], forward_loop=calibrate_loop)
     else:
+        print(calibrate_loop)
         model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     end_time = time.time()
     print(f"Quantization done. Total time used: {end_time - start_time}s")
@@ -210,30 +337,33 @@ def main(args):
     # launch a memory monitor to read the currently used GPU memory.
     launch_memory_monitor()
 
-    # Force eager execution for all model types.
-    torch.compiler.set_stance("force_eager")
-
     # Check that only one quantization format is provided for non auto_quant case
     if not args.auto_quantize_bits:
         assert len(args.qformat.split(",")) == 1, (
             "Quantization supports only one quantization format."
         )
 
-    if not args.auto_quantize_bits:
-        assert (
-            args.qformat
-            in [
-                "int4_awq",
-                "fp8",
-                "nvfp4",
-                "nvfp4_awq",
-                "w4a8_awq",
-                "fp8_pb_wo",
-                "w4a8_mxfp4_fp8",
-                "nvfp4_mlp_only",
-            ]
-            or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
-        ), f"Quantization format {args.qformat} not supported for HF export path"
+    print(args)
+
+    # Check arguments for unified_hf export format and set to default if unsupported arguments are provided
+    if args.export_fmt == "hf":
+        assert args.sparsity_fmt == "dense", (
+            f"Sparsity format {args.sparsity_fmt} not supported by unified export api."
+        )
+
+        if not args.auto_quantize_bits:
+            assert (
+                args.qformat
+                in [
+                    "int4_awq",
+                    "fp8",
+                    "nvfp4",
+                    "nvfp4_awq",
+                    "w4a8_awq",
+                    "fp8_pb_wo",
+                ]
+                or args.kv_cache_qformat in KV_QUANT_CFG_CHOICES
+            ), f"Quantization format {args.qformat} not supported for HF export path"
 
     # If low memory mode is enabled, we compress the model while loading the HF checkpoint.
     calibration_only = False
@@ -247,6 +377,9 @@ def main(args):
             attn_implementation=args.attn_implementation,
         )
     else:
+        assert args.export_fmt == "hf", (
+            "Low memory mode is only supported for exporting HF checkpoint."
+        )
         assert args.qformat in QUANT_CFG_CHOICES, (
             f"Quantization format is not supported for low memory mode. Supported formats: {QUANT_CFG_CHOICES.keys()}"
         )
@@ -255,11 +388,7 @@ def main(args):
             quant_cfg = apply_kv_cache_quant(
                 quant_cfg, getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"]
             )
-
-        # Do not use real quant GEMM so the calibration can be more accurate.
-        with init_quantized_weights(
-            quant_cfg, gpu_mem_percentage=args.gpu_max_mem_percentage, quant_gemm=False
-        ):
+        with init_quantized_weights(quant_cfg, gpu_mem_percentage=args.gpu_max_mem_percentage):
             model_kwargs = {"trust_remote_code": args.trust_remote_code}
             if args.attn_implementation is not None:
                 model_kwargs["attn_implementation"] = args.attn_implementation
@@ -277,10 +406,15 @@ def main(args):
         device = model.model.device
     processor = None
     tokenizer = None
-
-    full_model = model
-
     if model_type == "mllama":
+        if args.dataset is None:
+            args.dataset = "scienceqa"
+            warnings.warn(
+                "Currently only the scienceqa dataset is supported for the mllama model. "
+                "Overriding dataset to scienceqa."
+            )
+        elif args.dataset != "scienceqa":
+            raise ValueError("Only the scienceqa dataset is supported for the mllama model.")
         processor = get_processor(
             args.pyt_ckpt_path,
             model_type,
@@ -289,46 +423,31 @@ def main(args):
             attn_implementation=args.attn_implementation,
         )
     elif model_type == "whisper":
+        if args.dataset is None:
+            args.dataset = "peoples_speech"
+            warnings.warn(
+                "Currently only the peoples_speech dataset is supported for the whisper model. "
+                "Overriding dataset to peoples_speech."
+            )
+        elif args.dataset != "peoples_speech":
+            raise ValueError("Only the peoples_speech dataset is supported for the whisper model.")
         processor = get_processor(
             args.pyt_ckpt_path, model_type, device, trust_remote_code=args.trust_remote_code
         )
     else:
         if args.dataset is None:
-            args.dataset = ["cnn_dailymail"]
+            args.dataset = "cnn_dailymail"
             warnings.warn("No dataset specified. Defaulting to cnn_dailymail.")
         tokenizer = get_tokenizer(args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code)
-
         default_padding_side = tokenizer.padding_side
         # Left padding usually provides better calibration result.
         tokenizer.padding_side = "left"
-
-        # We only quantize the language model for VLMs other than the type supported above.
-        if hasattr(model, "language_model"):
-            parent_model = model  # llama4 case
-            if isinstance(type(model).__dict__.get("language_model"), property):
-                assert hasattr(model, "model") and hasattr(model.model, "language_model"), (
-                    "Expected language_model in model.model, but attribute not found. "
-                    "This may indicate an unsupported model structure."
-                )
-                parent_model = model.model  # gemma3, qwen2.5 VL case
-
-            disabled_quant_cfg = {
-                "quant_cfg": {"default": {"enable": False}},
-                "algorithm": "max",
-            }
-
-            for name, child in parent_model.named_children():
-                # Apply disabled quant to all children except language_model so we can exclude them during HF export.
-                if name != "language_model":
-                    mtq.quantize(child, disabled_quant_cfg, forward_loop=None)
-
-            model = model.language_model
 
     if args.sparsity_fmt != "dense":
         if args.batch_size == 0:
             # Sparse algorithm takes more GPU memory so we reduce the batch_size by 4.
             args.batch_size = max(get_max_batch_size(model) // 4, 1)
-            args.batch_size = min(args.batch_size, sum(args.calib_size))
+            args.batch_size = min(args.batch_size, args.calib_size)
 
         print(f"Use calib batch_size {args.batch_size}")
 
@@ -351,6 +470,8 @@ def main(args):
         )
         mts.export(model)
 
+    print(args)
+
     if args.auto_quantize_bits or args.qformat in QUANT_CFG_CHOICES:
         if "awq" in args.qformat:
             print(
@@ -359,6 +480,10 @@ def main(args):
             )
 
         if args.batch_size == 0:
+            # TODO: Enable auto-batch size calculation for auto_quantize
+            assert args.auto_quantize_bits is None, (
+                "auto_quantize requires batch_size to be specified, please specify batch_size."
+            )
             # Calibration/sparsification will actually take much more memory than regular inference
             # due to intermediate tensors for fake quantization. Setting sample_memory_usage_ratio
             # to 2 to avoid OOM for AWQ/SmoothQuant fake quantization as it will take more memory than inference.
@@ -378,16 +503,12 @@ def main(args):
                 )
             else:
                 sample_input_single_batch = None
-
-            run_auto_quant = args.auto_quantize_bits is not None
-
             args.batch_size = get_max_batch_size(
                 model,
-                sample_memory_usage_ratio=sample_memory_usage_ratio if not run_auto_quant else 1.0,
+                sample_memory_usage_ratio=sample_memory_usage_ratio,
                 sample_input_single_batch=sample_input_single_batch,
-                enable_grad=run_auto_quant,
             )
-            args.batch_size = min(args.batch_size, sum(args.calib_size))
+            args.batch_size = min(args.batch_size, args.calib_size)
 
         print(f"Use calib batch_size {args.batch_size}")
 
@@ -396,27 +517,21 @@ def main(args):
             assert processor is not None and isinstance(processor, MllamaImageProcessor), (
                 "The MllamaImageProcessor must be set."
             )
-            assert len(args.calib_size) == 1, (
-                "mllama only supports one dataset for calibration, can extend this in the future"
-            )
             calib_dataloader = get_vlm_dataset_dataloader(
-                dataset_name=args.dataset[0] if args.dataset else "scienceqa",
+                dataset_name=args.dataset,
                 processor=processor,
                 batch_size=args.batch_size,
-                num_samples=args.calib_size[0],
+                num_samples=args.calib_size,
             )
         elif model_type == "whisper":
             assert processor is not None and isinstance(processor, WhisperProcessor), (
                 "The AutoProcessor must be set."
             )
-            assert len(args.calib_size) == 1, (
-                "whisper only supports one dataset for calibration, can extend this in the future"
-            )
             calib_dataloader, first_text = get_speech_dataset_dataloader(
-                dataset_name=args.dataset[0] if args.dataset else "peoples_speech",
+                dataset_name=args.dataset,
                 processor=processor,
                 batch_size=args.batch_size,
-                num_samples=args.calib_size[0],
+                num_samples=args.calib_size,
                 device=device,
                 dtype=model.dtype,
             )
@@ -424,6 +539,13 @@ def main(args):
             assert tokenizer is not None and isinstance(
                 tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)
             ), "The PreTrainedTokenizer must be set"
+            
+            args.batch_size = 8
+            args.calib_size = 1000
+            args.dataset = "/sdp/lkk/mlperf/TensorRT-LLM/examples/quantization/inference_results_v5.1/closed/NVIDIA/code/llama3_1-8b/tensorrt/build/preprocessed-data/llama3.1-8b/mlperf_llama3.1-8b_calibration_1k/"
+
+            args.batch_size = 1
+            args.calib_size = 1
             calib_dataloader = get_dataset_dataloader(
                 dataset_name=args.dataset,
                 tokenizer=tokenizer,
@@ -431,6 +553,7 @@ def main(args):
                 num_samples=args.calib_size,
                 device=device,
                 include_labels=args.auto_quantize_bits is not None,
+                max_sample_length=2048
             )
 
         quant_cfg = {}
@@ -457,8 +580,6 @@ def main(args):
             enable_quant_kv_cache = args.kv_cache_qformat != "none"
             print(f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization")
 
-            print(quant_cfg)
-
             # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.
             if enable_quant_kv_cache:
                 quant_cfg = apply_kv_cache_quant(
@@ -466,21 +587,9 @@ def main(args):
                     getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"],
                 )
 
-            print(quant_cfg)
-
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in args.qformat:
                 quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
-
-            if model_type == "phi4mm":
-                # Only quantize the language model
-                quant_cfg["quant_cfg"]["*speech*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*audio*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*image*"] = {"enable": False}
-                quant_cfg["quant_cfg"]["*vision*"] = {"enable": False}
-                warnings.warn(
-                    "Please set the default input_mode to InputMode.LANGUAGE before quantizing."
-                )
 
         if not model_is_already_quantized or calibration_only:
             # Only run single sample for preview
@@ -488,7 +597,7 @@ def main(args):
                 "input_features" if model_type == "whisper" else "input_ids"
             ][0:1]
             try:
-                generated_ids_before_ptq = full_model.generate(input_ids, max_new_tokens=100)
+                generated_ids_before_ptq = model.generate(input_ids, max_new_tokens=100)
             except Exception as e:
                 print(
                     "Error during model generation. Please check if your transformers version is "
@@ -496,9 +605,13 @@ def main(args):
                 )
                 print(f"Error details: {e}")
                 raise
-            if model_type == "gptoss" and args.qformat == "nvfp4_mlp_only":
-                print("Applying nvfp4 quantization (MoE only) for gpt-oss")
 
+
+            print("=="*20)
+            print(quant_cfg)
+            print(calib_dataloader)
+            print(calibration_only)
+            print(args)
             # quantize the model
             model = quantize_model(model, quant_cfg, args, calib_dataloader, calibration_only)
             if args.verbose:
@@ -508,8 +621,7 @@ def main(args):
             torch.cuda.empty_cache()
             generated_ids_after_ptq = None
             if model_type != "llama4":
-                # Our fake quantizer may not be fully compatible with torch.compile.
-                generated_ids_after_ptq = full_model.generate(input_ids, max_new_tokens=100)
+                generated_ids_after_ptq = model.generate(input_ids, max_new_tokens=100)
             else:
                 warnings.warn(
                     "Llama4 Maverick generation after quantization has a bug. Skipping generation sample."
@@ -565,27 +677,6 @@ def main(args):
 
         export_path = args.export_path
 
-        # Check if the model is a multimodal/VLM model
-        is_vlm = is_multimodal_model(full_model)
-
-        if is_vlm:
-            # Save original model config and the processor config to the export path for VLMs.
-            print(f"Saving original model config to {export_path}")
-
-            AutoConfig.from_pretrained(
-                args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
-            ).save_pretrained(export_path)
-
-            # Try to save processor config if available
-            try:
-                print(f"Saving processor config to {export_path}")
-                AutoProcessor.from_pretrained(
-                    args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
-                ).save_pretrained(export_path)
-            except Exception as e:
-                print(f"Warning: Could not save processor config: {e}")
-                print("This is normal for some VLM architectures that don't use AutoProcessor")
-
         if model_type == "mllama":
             full_model_config = model.config
             model = model.language_model
@@ -595,41 +686,48 @@ def main(args):
             setattr(model.config, "architectures", full_model_config.architectures)
 
         start_time = time.time()
-        if (
-            model_type in ["t5", "bart", "whisper"]
-            or args.sparsity_fmt != "dense"
-            or "int8_sq" in args.qformat
-        ):
-            warnings.warn(
-                "Still exporting TensorRT-LLM checkpoints for models not supported by the TensorRT-LLM torch runtime."
-            )
-
+        if args.export_fmt == "tensorrt_llm":
             # Move meta tensor back to device before exporting.
             remove_hook_from_module(model, recurse=True)
+
+            dtype = None
+            if "w4a8_awq" in args.qformat:
+                # TensorRT-LLM w4a8 only support fp16 as the dtype.
+                dtype = torch.float16
+
+            # For Gemma2-27B, TRT-LLM only works with bfloat16 as the dtype.
+            if model_type == "gemma2":
+                dtype = torch.bfloat16
 
             export_tensorrt_llm_checkpoint(
                 model,
                 model_type,
+                dtype=dtype,
                 export_dir=export_path,
                 inference_tensor_parallel=args.inference_tensor_parallel,
                 inference_pipeline_parallel=args.inference_pipeline_parallel,
             )
-        else:
-            # Check arguments for unified_hf export format and set to default if unsupported arguments are provided
-            assert args.sparsity_fmt == "dense", (
-                f"Sparsity format {args.sparsity_fmt} not supported by unified export api."
-            )
-
-            if args.inference_tensor_parallel != 1 or args.inference_pipeline_parallel != 1:
-                warnings.warn(
-                    "Unified HF export format does not specify inference tensor parallel or pipeline parallel. "
-                    "They will be set at deployment time."
-                )
-
+        elif args.export_fmt == "hf":
             export_hf_checkpoint(
-                full_model,
+                model,
                 export_dir=export_path,
             )
+            if model_type == "llama4":
+                # TRT-LLM expects the original model config instead of the config from text model,
+                # so we need to copy the original model config to the export path.
+                # Also we copy the preprocessor config to the export path.
+                from transformers import AutoConfig, AutoProcessor
+
+                # Use HuggingFace API to handle both model IDs and local paths
+                AutoConfig.from_pretrained(
+                    args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
+                ).save_pretrained(export_path)
+
+                AutoProcessor.from_pretrained(
+                    args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
+                ).save_pretrained(export_path)
+        else:
+            raise NotImplementedError(f"{args.export_fmt} not supported")
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
@@ -665,24 +763,15 @@ if __name__ == "__main__":
         default=0,
     )
     parser.add_argument(
-        "--calib_size",
-        help=(
-            "Number of samples for calibration. If a comma separated list of values is provided, "
-            "each value will be used as the calibration size for the corresponding dataset. "
-            "This argument will be parsed and converted as a list of ints."
-        ),
-        type=str,
-        default="512",
+        "--calib_size", help="Number of samples for calibration.", type=int, default=512
     )
     parser.add_argument("--export_path", default="exported_model")
     parser.add_argument(
         "--dataset",
-        help=(
-            f"name of a dataset, or a comma separated list of datasets. "
-            f"dataset choices are {get_supported_datasets()}"
-        ),
+        help="name of dataset.",
         type=str,
         default=None,
+        choices=["magpie", "cnn_dailymail", "pile", "pg19", "wikipedia"],
     )
     parser.add_argument("--inference_tensor_parallel", type=int, default=1)
     parser.add_argument("--inference_pipeline_parallel", type=int, default=1)
@@ -710,11 +799,17 @@ if __name__ == "__main__":
         help="Specify KV cache quantization format, default to fp8 if not provided",
     )
     parser.add_argument(
+        "--vlm",
+        help="Specify whether this is a visual-language model",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
         "--export_fmt",
         required=False,
-        default="hf",
+        default="tensorrt_llm",
         choices=["tensorrt_llm", "hf"],
-        help="Deprecated. Please avoid using this argument.",
+        help=("Checkpoint export format"),
     )
     parser.add_argument(
         "--trust_remote_code",
@@ -727,7 +822,7 @@ if __name__ == "__main__":
         help=(
             "Specify the percentage of available GPU memory to use for loading the model when "
             "device_map is set to sequential. "
-            "By default, 80%% of the available GPU memory is used."
+            "By default, 80% of the available GPU memory is used."
         ),
         type=float,
         default=0.8,
@@ -744,7 +839,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--verbose",
-        help="Print verbose output (e.g. quantization summary). Disable by --no-verbose.",
+        help="Print verbose output (e.g. quantization summary). Disable by --no_verbose.",
         default=True,
         action=argparse.BooleanOptionalAction,
     )
@@ -769,9 +864,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.export_fmt != "hf":
-        warnings.warn("Deprecated. --export_fmt forced to hf.")
-
-    args.dataset = args.dataset.split(",") if args.dataset else None
-    args.calib_size = [int(num_sample) for num_sample in args.calib_size.split(",")]
     main(args)

@@ -653,6 +653,8 @@ class TensorQuantizer(nn.Module):
             amax = self._get_amax(inputs)
             self._validate_amax(amax)
 
+        # print(f"===============================_fake_quantize: ", amax, "attr: ", hasattr(self, "_amax"))
+
         if self.block_sizes is not None and self.block_sizes.get("type", "static") == "dynamic":
             # Block quantization, including dynamic and static block quantization
             block_size = self.block_sizes.get(-1, None) or self.block_sizes.get(

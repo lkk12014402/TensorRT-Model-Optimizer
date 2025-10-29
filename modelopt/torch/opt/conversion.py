@@ -415,6 +415,8 @@ def apply_mode(
     for (m, config), kwargs in zip(mode_and_config, mode_kwargs):
         manager.check_mode(m)
         config = manager.get_config_class(m, config)
+        print(config)
+        print(get_mode(m))
         model, metadata = get_mode(m).convert(model, config, **kwargs)  # type: ignore  [call-arg]
         manager.add_mode(m, config, metadata)
 

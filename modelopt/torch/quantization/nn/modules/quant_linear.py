@@ -44,6 +44,8 @@ class _QuantLinear(QuantLinearConvBase):
     @staticmethod
     def quantized_linear_fn(package, func_name, self, input, weight, *args, **kwargs):
         """Quantized version of a generic linear functional."""
+
+        print("=============================================================_QuantLinear: quantized_linear_fn")
         output = getattr(package, func_name)(
             self.input_quantizer(input),
             self.weight_quantizer(weight),

@@ -59,6 +59,8 @@ def convert_to_quantized_model(model: ModelLikeModule, config: QuantizeConfig) -
 
     replace_quant_module(model, version=ModeloptStateManager(model).state_version)
     set_quantizer_by_cfg(model, config.get("quant_cfg", {}))
+    print(model)
+    # exit()
 
     metadata = {}
     update_quantize_metadata(model, config, metadata)
@@ -185,18 +187,34 @@ def replace_quant_module(model: nn.Module, version=None, registry=QuantModuleReg
     if type(model) in registry:
         model = registry.convert(model)
 
+    print("============================replace_quant_module: ")
+    print(model)
+    print(version)
+    print(registry)
+    print("=="*30)
     _replace_quant_module(model, version=version, registry=registry)
     register_custom_post_conversion_plugins(model)
+
     replaced_modules = sum(isinstance(m, TensorQuantizer) for _, m in model.named_modules())
     print(f"Inserted {replaced_modules} quantizers")
 
 
 def _replace_quant_module(model: nn.Module, version=None, registry=QuantModuleRegistry):
     """Helper function of replace_quant_module."""
+    print("=============================================_replace_quant_module: ")
+    print(registry)
+    # print(registry.__dict__)
     for name, child in model.named_children():
         if type(child) in registry:
+            print("=*="*20)
+            print(type(child))
+            print(name)
+
             # REPLACE on the parent (model), not on child
             quantized = registry.convert(child)
+            print(quantized)
+            print("=*="*20)
+
             setattr(model, name, quantized)
 
         # now recurse into whichever module is now at `model.name`

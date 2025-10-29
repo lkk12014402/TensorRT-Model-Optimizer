@@ -221,6 +221,9 @@ def _export_quantized_weight(
         sub_module, quantizer_attrs.output_quantizer, None
     )
 
+
+    print(quantization_format)
+
     if quantization_format == QUANTIZATION_FP8:
         # Convert amax to float32
         weight_quantizer._amax = weight_quantizer._amax.to(torch.float32)
@@ -262,6 +265,7 @@ def _export_quantized_weight(
             )
             del weight_quantizer._scale
         else:
+            print("mxfp8/mxfp4 here ????????????????????????????????????????????????????????")
             sub_module.register_buffer(
                 quantizer_attrs.weight_scale, get_weight_scaling_factor(sub_module, weight_name)
             )
@@ -271,6 +275,8 @@ def _export_quantized_weight(
             and "disabled" not in repr(input_quantizer)
             and input_quantizer.amax is not None
         ):
+            print("mxfp8/mxfp4 don't need input scale ???????????????????????????????")
+            # exit()
             sub_module.register_buffer(
                 quantizer_attrs.input_scale,
                 get_activation_scaling_factor(
@@ -329,6 +335,9 @@ def _export_quantized_weight(
             weight_scale_2,
             block_size,
         )
+
+    # print(quantized_weight)
+    # exit()
 
     setattr(sub_module, weight_name, nn.Parameter(quantized_weight, requires_grad=False))
 
@@ -479,6 +488,7 @@ def _export_hf_checkpoint(
                     _export_quantized_weight(sub_module, dtype, weight_name)
 
     quantized_state_dict = model.state_dict()
+    print(quantized_state_dict)
 
     quantized_state_dict = postprocess_state_dict(
         quantized_state_dict, kv_cache_max_bound, kv_cache_format

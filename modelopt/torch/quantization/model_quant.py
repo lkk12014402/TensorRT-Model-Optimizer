@@ -223,6 +223,8 @@ def quantize(
     Returns: A pytorch model which has been quantized and calibrated.
     """
     model = apply_mode(model, mode=[("quantize", config)], registry=QuantizeModeRegistry)
+    #print(model)
+    # exit()
     return calibrate(model, config["algorithm"], forward_loop=forward_loop)
 
 

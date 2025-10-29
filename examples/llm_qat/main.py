@@ -49,6 +49,10 @@ from modelopt.torch.distill.plugins.huggingface import LMLogitsLoss
 from modelopt.torch.quantization.plugins.transformers_trainer import QADTrainer, QATTrainer
 from modelopt.torch.utils import print_rank_0
 
+from transformers import set_seed
+
+set_seed(42)
+
 # Enable automatic save/load of modelopt state huggingface checkpointing
 mto.enable_huggingface_checkpointing()
 
@@ -106,7 +110,7 @@ class TrainingArguments(transformers.TrainingArguments):
 class DataArguments:
     dataset: str = field(
         default="Daring-Anteater",
-        metadata={"help": "Specify the dataset.", "choices": ["Daring-Anteater"]},
+        metadata={"help": "Specify the dataset.", "choices": ["Daring-Anteater", "cnn_dailymail"]},
     )
     train_size: int = field(
         default=0,
@@ -196,6 +200,7 @@ def train():
         train_size=data_args.train_size,
         eval_size=data_args.eval_size,
     )
+    print(data_module)
 
     # Ensure calibration size doesn't exceed evaluation dataset size
     eval_dataset_size = len(data_module["eval_dataset"])
@@ -205,6 +210,8 @@ def train():
         )
         quant_args.calib_size = eval_dataset_size
 
+
+    # quant_args.calib_size = 1
     # Training
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
@@ -261,6 +268,8 @@ def train():
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=checkpoint)
         print_rank_0("Training completed.")
+
+    print(model)
 
     if training_args.do_eval:
         metrics = trainer.evaluate()
